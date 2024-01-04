@@ -1,51 +1,52 @@
 import logging
-import time
 from typing import Optional
 from sentence_transformers import SentenceTransformer
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
-import os
+import time
+from timeit import default_timer
+import torch
+import numpy as np
+import logging
 
-MODEL_NAME = os.getenv("MODEL", "all-MiniLM-L6-v2")
-AUTH = f"Bearer {os.getenv('KEY', 'YOUR_KEY')}"
-
-model = SentenceTransformer(MODEL_NAME)
-app = FastAPI()
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
+MODEL_NAME = "all-MiniLM-L6-v2"
+AUTH = "Bearer YOUR_KEY"
+
+def initialize_model():
+  model = SentenceTransformer(MODEL_NAME, device='cuda')
+  return model
+
+model = initialize_model()
+
+app = FastAPI()
 
 class EmbeddingBody(BaseModel):
-    input: str = Field(description="Your text string goes here")
-    model: str | None = Field(
-        default=None, title="model name. not in use", max_length=300
-    )
+  input: str | list[str] = Field(description="Your text string goes here")
+  model: str | None = Field(default=None, max_length=500)
 
 
-@app.post(
-    "/v1/embeddings",
-)
+@app.post("/v1/embeddings")
 async def root(body: EmbeddingBody, Authorization: Optional[str] = Header(None)):
-    if AUTH != Authorization:
-        raise HTTPException(
-            status_code=401,
-            detail="Authroization: Bearer YOUR_KEY must be provided",
-        )
 
-    sentences = [body.input]
-    start = time.time()
+  if AUTH != Authorization:
+    raise HTTPException(status_code=401, detail="Authorization header required")
 
-    embeddings = model.encode(sentences)
-    logger.info("%s took %f", body.input, time.time() - start)
+  start = default_timer()
 
-    return {
-        "data": [
-            {
-                "embedding": embeddings[0].tolist(),
-                "index": 0,
-                "object": "embedding",
-            }
-        ],
-        "model": MODEL_NAME,
-        "object": "list",
-        "usage": {"prompt_tokens": 0, "total_tokens": 0},
-    }
+  embeddings = model.encode(body.input, device='cuda', normalize_embeddings=True,show_progress_bar=True)
+
+  elapsed = default_timer() - start
+
+  logger.info("%s took %f", body.input, elapsed)
+
+  return {
+    "data": {
+      "embedding": embeddings.tolist(),
+      "index": 0,
+      "object": "embedding"
+    } ,
+    "model": MODEL_NAME
+  }
