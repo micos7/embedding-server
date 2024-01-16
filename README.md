@@ -10,6 +10,8 @@ Embeddings supports modern day AI use cases for Classification, clustering, sema
 
 ![Private Embedding Server](images/example.jpeg "Private Embedding Server")
 
+MODEL=distiluse-base-multilingual-cased-v2  uvicorn 'server:app' --port 9002 --workers=4
+
 ## Usage
 
 ```
