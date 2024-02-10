@@ -16,7 +16,9 @@ import io
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-MODEL_NAME = "distiluse-base-multilingual-cased-v2"
+# MODEL_NAME = "distiluse-base-multilingual-cased-v2"
+# MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_NAME = "paraphrase-multilingual-mpnet-base-v2"
 AUTH = "Bearer YOUR_KEY"
 
 def initialize_model():
