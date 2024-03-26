@@ -8,7 +8,7 @@ from timeit import default_timer
 import torch
 import numpy as np
 import logging
-import PyPDF2
+from pypdf import PdfReader
 import tracemalloc
 import requests
 import io
@@ -81,7 +81,7 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
     pdf_content = requests.get(body.url).content
 
     with io.BytesIO(pdf_content) as file:
-        pdf_reader = PyPDF2.PdfReader(file)
+        pdf_reader = PdfReader(file)
         embedding_responses = []
 
         for page_number, page in enumerate(pdf_reader.pages):
