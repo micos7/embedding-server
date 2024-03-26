@@ -22,19 +22,23 @@ MODEL_NAME = "paraphrase-multilingual-mpnet-base-v2"
 AUTH = "Bearer YOUR_KEY"
 
 def initialize_model():
-  model = SentenceTransformer(MODEL_NAME, device='cuda')
-  return model
+    try:
+        model = SentenceTransformer(MODEL_NAME, device='cuda')
+    except Exception as e:
+        logger.error(f"Error initializing model: {e}")
+        raise
+    return model
 
 model = initialize_model()
 
 app = FastAPI()
 
 class EmbeddingBody(BaseModel):
-  input: str | list[str] = Field(description="Your text string goes here")
-  model: str | None = Field(default=None, max_length=500)
+    input: str | list[str] = Field(description="Your text string goes here")
+    model: str | None = Field(default=None, max_length=500)
 
 class PDFBody(BaseModel):
-   url: str | list[str] = Field(description="Your text string goes here")
+    url: str | list[str] = Field(description="Your text string goes here")
 
 class PDFEmbeddingResponse(BaseModel):
     data: List[dict]
@@ -42,50 +46,59 @@ class PDFEmbeddingResponse(BaseModel):
 
 @app.post("/v1/embeddings")
 async def root(body: EmbeddingBody, Authorization: Optional[str] = Header(None)):
+    if AUTH != Authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
 
-  if AUTH != Authorization:
-    raise HTTPException(status_code=401, detail="Authorization header required")
+    start = default_timer()
 
-  start = default_timer()
+    try:
+        embeddings = model.encode(body.input, device='cuda', normalize_embeddings=True, show_progress_bar=True)
+    except Exception as e:
+        logger.error(f"Error encoding input: {e}")
+        raise HTTPException(status_code=500, detail="Error encoding input")
 
-  embeddings = model.encode(body.input, device='cuda', normalize_embeddings=True,show_progress_bar=True)
+    elapsed = default_timer() - start
 
-  elapsed = default_timer() - start
-
-#   logger.info("%s took %f", body.input, elapsed)
-
-  return {
-    "data": {
-      "embedding": embeddings.tolist(),
-      "index": 0,
-      "object": "embedding"
-    } ,
-    "model": MODEL_NAME
-  }
-
-from typing import Optional, List
-from fastapi import Header, HTTPException
-
-
+    return {
+        "data": {
+            "embedding": embeddings.tolist(),
+            "index": 0,
+            "object": "embedding"
+        },
+        "model": MODEL_NAME
+    }
 
 @app.post("/v1/pdf")
 async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(None)):
-
     if AUTH != Authorization:
         raise HTTPException(status_code=401, detail="Authorization header required")
 
     start = default_timer()
     tracemalloc.start()
 
-    # Fetch PDF content from the URL
-    pdf_content = requests.get(body.url).content
+    try:
+        # Fetch PDF content from the URL
+        pdf_content = requests.get(body.url).content
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching PDF content: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching PDF content")
 
     with io.BytesIO(pdf_content) as file:
-        pdf_reader = PdfReader(file)
+        try:
+            pdf_reader = PdfReader(file)
+        except Exception as e:
+            logger.error(f"Error reading PDF: {e}")
+            raise HTTPException(status_code=500, detail="Error reading PDF")
+
         embedding_responses = []
 
         for page_number, page in enumerate(pdf_reader.pages):
-            page_text = page.extract_text()
+            try:
+                page_text = page.extract_text()
+            except Exception as e:
+                logger.error(f"Error extracting text from page {page_number}: {e}")
+                continue
+
             sentences = [sentence.strip() for sentence in page_text.split('.')]
 
             chunked_sentences = []
@@ -103,7 +116,11 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
             if current_chunk:
                 chunked_sentences.append(current_chunk)
 
-            embeddings = [model.encode(chunk, device='cuda', normalize_embeddings=True) for chunk in chunked_sentences]
+            try:
+                embeddings = [model.encode(chunk, device='cuda', normalize_embeddings=True) for chunk in chunked_sentences]
+            except Exception as e:
+                logger.error(f"Error encoding text chunks for page {page_number}: {e}")
+                continue
 
             for i, (embedding, sentence) in enumerate(zip(embeddings, chunked_sentences)):
                 embedding_responses.append({
@@ -119,6 +136,3 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
     tracemalloc.stop()
 
     return PDFEmbeddingResponse(data=embedding_responses, model=MODEL_NAME)
-
-
-
