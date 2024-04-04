@@ -12,6 +12,7 @@ from pypdf import PdfReader
 import tracemalloc
 import requests
 import io
+import asyncio
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -68,6 +69,10 @@ async def root(body: EmbeddingBody, Authorization: Optional[str] = Header(None))
         "model": MODEL_NAME
     }
 
+
+
+from concurrent.futures import ThreadPoolExecutor
+
 @app.post("/v1/pdf")
 async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(None)):
     if AUTH != Authorization:
@@ -92,17 +97,12 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
 
         embedding_responses = []
 
-        for page_number, page in enumerate(pdf_reader.pages):
-            try:
-                page_text = page.extract_text()
-            except Exception as e:
-                logger.error(f"Error extracting text from page {page_number}: {e}")
-                continue
-
+        async def process_page(page_number, page):
+            page_text = page.extract_text()
             sentences = [sentence.strip() for sentence in page_text.split('.')]
-
             chunked_sentences = []
             current_chunk = ""
+
             for sentence in sentences:
                 if len(current_chunk) + len(sentence) + 1 <= 600:  # +1 for the period
                     if current_chunk:
@@ -117,10 +117,10 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
                 chunked_sentences.append(current_chunk)
 
             try:
-                embeddings = [model.encode(chunk, device='cuda', normalize_embeddings=True) for chunk in chunked_sentences]
+                embeddings = await asyncio.gather(*[asyncio.to_thread(model.encode, chunk, device='cuda', normalize_embeddings=True) for chunk in chunked_sentences])
             except Exception as e:
                 logger.error(f"Error encoding text chunks for page {page_number}: {e}")
-                continue
+                return
 
             for i, (embedding, sentence) in enumerate(zip(embeddings, chunked_sentences)):
                 embedding_responses.append({
@@ -131,6 +131,9 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
                     "page": page_number  # Page numbers are usually 1-based
                 })
 
+        for page_number, page in enumerate(pdf_reader.pages):
+                    await process_page(page_number, page)
+                    
     elapsed = default_timer() - start
     print(tracemalloc.get_traced_memory())
     tracemalloc.stop()
