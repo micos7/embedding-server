@@ -12,13 +12,11 @@ from pypdf import PdfReader
 import tracemalloc
 import requests
 import io
-import asyncio
+import concurrent.futures
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# MODEL_NAME = "distiluse-base-multilingual-cased-v2"
-# MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 MODEL_NAME = "paraphrase-multilingual-mpnet-base-v2"
 AUTH = "Bearer YOUR_KEY"
 
@@ -73,6 +71,9 @@ async def root(body: EmbeddingBody, Authorization: Optional[str] = Header(None))
 
 from concurrent.futures import ThreadPoolExecutor
 
+def encode_chunk(chunk, model):
+    return model.encode(chunk, device='cuda', normalize_embeddings=True)
+
 @app.post("/v1/pdf")
 async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(None)):
     if AUTH != Authorization:
@@ -117,7 +118,8 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
                 chunked_sentences.append(current_chunk)
 
             try:
-                embeddings = await asyncio.gather(*[asyncio.to_thread(model.encode, chunk, device='cuda', normalize_embeddings=True) for chunk in chunked_sentences])
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    embeddings = list(executor.map(lambda x: encode_chunk(x, model), chunked_sentences))
             except Exception as e:
                 logger.error(f"Error encoding text chunks for page {page_number}: {e}")
                 return
@@ -133,7 +135,7 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
 
         for page_number, page in enumerate(pdf_reader.pages):
                     await process_page(page_number, page)
-                    
+
     elapsed = default_timer() - start
     print(tracemalloc.get_traced_memory())
     tracemalloc.stop()
