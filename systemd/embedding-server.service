@@ -1,8 +1,11 @@
 [Unit]
 Description=Embedding Server
-After=multi-user.target[Service]
+After=multi-user.target
+
+[Service]
 Type=simple
 Restart=always
-ExecStart=/usr/bin/python3 -m embedding_server
+WorkingDirectory=/var/www/html/summarizepdf/embedding-server
+ExecStart=/var/www/html/summarizepdf/embedding-server/venv/bin/python -m embedding_server
 WantedBy=multi-user.target
-DynamicUser=yes 
+DynamicUser=yes

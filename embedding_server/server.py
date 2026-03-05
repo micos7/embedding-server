@@ -1,18 +1,18 @@
 import logging
+import time
+import io
+import re
+import tracemalloc
 from typing import Optional, List
+from timeit import default_timer
+
+import torch
+import numpy as np
+import httpx
 from sentence_transformers import SentenceTransformer
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
-import time
-from timeit import default_timer
-import torch
-import numpy as np
-import logging
 from pypdf import PdfReader
-import tracemalloc
-import requests
-import io
-import concurrent.futures
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -20,9 +20,19 @@ logger.setLevel(logging.INFO)
 MODEL_NAME = "paraphrase-multilingual-mpnet-base-v2"
 AUTH = "Bearer YOUR_KEY"
 
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+DEVICE = get_device()
+logger.info(f"Using device: {DEVICE}")
+
 def initialize_model():
     try:
-        model = SentenceTransformer(MODEL_NAME, device='cuda')
+        model = SentenceTransformer(MODEL_NAME, device=DEVICE)
     except Exception as e:
         logger.error(f"Error initializing model: {e}")
         raise
@@ -51,28 +61,80 @@ async def root(body: EmbeddingBody, Authorization: Optional[str] = Header(None))
     start = default_timer()
 
     try:
-        embeddings = model.encode(body.input, device='cuda', normalize_embeddings=True, show_progress_bar=True)
+        # handle single string or list of strings
+        embeddings = model.encode(body.input, device=DEVICE, normalize_embeddings=True, show_progress_bar=False)
     except Exception as e:
         logger.error(f"Error encoding input: {e}")
         raise HTTPException(status_code=500, detail="Error encoding input")
 
     elapsed = default_timer() - start
+    logger.info(f"Embedding generated in {elapsed:.3f}s")
 
-    return {
-        "data": {
+    # OpenAI-like response format
+    if isinstance(body.input, str):
+        data = {
             "embedding": embeddings.tolist(),
             "index": 0,
             "object": "embedding"
-        },
-        "model": MODEL_NAME
+        }
+    else:
+        data = [
+            {
+                "embedding": emb.tolist(),
+                "index": i,
+                "object": "embedding"
+            } for i, emb in enumerate(embeddings)
+        ]
+
+    return {
+        "data": data,
+        "model": MODEL_NAME,
+        "usage": {
+            "total_tokens": 0  # We don't have token count here easily
+        }
     }
 
+def chunk_text(text: str, max_chars: int = 600) -> List[str]:
+    if not text:
+        return []
+    
+    # Split by common sentence terminators followed by whitespace
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current_chunk = []
+    current_len = 0
 
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        
+        # If a single sentence is longer than max_chars, we might need to split it further
+        # but for now we just keep it as is or split it crudely if it's massive
+        if len(sentence) > max_chars:
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_len = 0
+            
+            # Simple crude split for massive sentences
+            for i in range(0, len(sentence), max_chars):
+                chunks.append(sentence[i:i+max_chars])
+            continue
 
-from concurrent.futures import ThreadPoolExecutor
+        if current_len + len(sentence) + 1 > max_chars:
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+            current_chunk = [sentence]
+            current_len = len(sentence)
+        else:
+            current_chunk.append(sentence)
+            current_len += len(sentence) + 1
 
-def encode_chunk(chunk, model):
-    return model.encode(chunk, device='cuda', normalize_embeddings=True)
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    
+    return chunks
 
 @app.post("/v1/pdf")
 async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(None)):
@@ -82,12 +144,20 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
     start = default_timer()
     tracemalloc.start()
 
+    url = body.url if isinstance(body.url, str) else body.url[0]
+
     try:
-        # Fetch PDF content from the URL
-        pdf_content = requests.get(body.url).content
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching PDF content: {e}")
-        raise HTTPException(status_code=500, detail="Error fetching PDF content")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            pdf_content = response.content
+    except Exception as e:
+        logger.error(f"Error fetching PDF content from {url}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching PDF content: {str(e)}")
+
+    embedding_responses = []
+    all_chunks = []
+    chunk_metadata = []
 
     with io.BytesIO(pdf_content) as file:
         try:
@@ -96,48 +166,46 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
             logger.error(f"Error reading PDF: {e}")
             raise HTTPException(status_code=500, detail="Error reading PDF")
 
-        embedding_responses = []
-
-        async def process_page(page_number, page):
-            page_text = page.extract_text()
-            sentences = [sentence.strip() for sentence in page_text.split('.')]
-            chunked_sentences = []
-            current_chunk = ""
-
-            for sentence in sentences:
-                if len(current_chunk) + len(sentence) + 1 <= 600:  # +1 for the period
-                    if current_chunk:
-                        current_chunk += ' ' + sentence + '.'
-                    else:
-                        current_chunk = sentence + '.'
-                else:
-                    chunked_sentences.append(current_chunk)
-                    current_chunk = sentence + '.'
-
-            if current_chunk:
-                chunked_sentences.append(current_chunk)
-
+        for page_number, page in enumerate(pdf_reader.pages):
             try:
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    embeddings = list(executor.map(lambda x: encode_chunk(x, model), chunked_sentences))
+                page_text = page.extract_text()
+                if not page_text:
+                    continue
             except Exception as e:
-                logger.error(f"Error encoding text chunks for page {page_number}: {e}")
-                return
+                logger.error(f"Error extracting text from page {page_number}: {e}")
+                continue
 
-            for i, (embedding, sentence) in enumerate(zip(embeddings, chunked_sentences)):
-                embedding_responses.append({
-                    "embedding": embedding.tolist(),
-                    "text": sentence,
+            page_chunks = chunk_text(page_text)
+            for i, chunk in enumerate(page_chunks):
+                all_chunks.append(chunk)
+                chunk_metadata.append({
+                    "text": chunk,
                     "index": i,
-                    "object": "embedding",
-                    "page": page_number  # Page numbers are usually 1-based
+                    "page": page_number
                 })
 
-        for page_number, page in enumerate(pdf_reader.pages):
-                    await process_page(page_number, page)
+    if all_chunks:
+        try:
+            # Batch encode all chunks for performance
+            embeddings = model.encode(all_chunks, device=DEVICE, normalize_embeddings=True, show_progress_bar=False)
+            
+            for i, emb in enumerate(embeddings):
+                meta = chunk_metadata[i]
+                embedding_responses.append({
+                    "embedding": emb.tolist(),
+                    "text": meta["text"],
+                    "index": meta["index"],
+                    "object": "embedding",
+                    "page": meta["page"]
+                })
+        except Exception as e:
+            logger.error(f"Error encoding chunks: {e}")
+            raise HTTPException(status_code=500, detail="Error generating embeddings")
 
     elapsed = default_timer() - start
-    print(tracemalloc.get_traced_memory())
+    mem_usage = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+    
+    logger.info(f"PDF processed in {elapsed:.3f}s. Memory peaked at {mem_usage[1] / 1024 / 1024:.2f} MB")
 
     return PDFEmbeddingResponse(data=embedding_responses, model=MODEL_NAME)
