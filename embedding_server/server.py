@@ -111,6 +111,7 @@ class EmbeddingBody(BaseModel):
 class PDFBody(BaseModel):
     url: str | list[str] = Field(description="URL of the PDF to embed")
     chunk_size: int = Field(default=600, ge=100, le=4000)
+    chunk_overlap: int = Field(default=120, ge=0, le=1000)
 
 
 class PDFEmbeddingResponse(BaseModel):
@@ -232,14 +233,16 @@ async def _fetch_pdf(url: str) -> bytes:
         raise HTTPException(status_code=500, detail=f"Error fetching PDF content: {str(e)}")
 
 
-def chunk_text(text: str, max_chars: int = 600) -> List[str]:
+def chunk_text(text: str, max_chars: int = 600, overlap_chars: int = 120) -> List[str]:
     if not text:
         return []
+
+    overlap_chars = max(0, min(overlap_chars, max_chars // 2))
 
     # Split by common sentence terminators followed by whitespace
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
-    current_chunk = []
+    current_chunk: List[str] = []
     current_len = 0
 
     for sentence in sentences:
@@ -253,19 +256,37 @@ def chunk_text(text: str, max_chars: int = 600) -> List[str]:
                 current_chunk = []
                 current_len = 0
 
-            # Simple crude split for massive sentences
-            for i in range(0, len(sentence), max_chars):
-                chunks.append(sentence[i:i + max_chars])
+            # Step with overlap for massive sentences
+            step = max(1, max_chars - overlap_chars)
+            for i in range(0, len(sentence), step):
+                piece = sentence[i:i + max_chars]
+                if piece:
+                    chunks.append(piece)
+                if i + max_chars >= len(sentence):
+                    break
             continue
 
         if current_len + len(sentence) + 1 > max_chars:
             if current_chunk:
                 chunks.append(" ".join(current_chunk))
-            current_chunk = [sentence]
-            current_len = len(sentence)
+                # Carry over trailing sentences that fit within overlap_chars
+                overlap_chunk: List[str] = []
+                overlap_len = 0
+                for prev_sent in reversed(current_chunk):
+                    added_len = len(prev_sent) + (1 if overlap_chunk else 0)
+                    if overlap_len + added_len <= overlap_chars and overlap_len + added_len + 1 + len(sentence) <= max_chars:
+                        overlap_chunk.insert(0, prev_sent)
+                        overlap_len += added_len
+                    else:
+                        break
+                current_chunk = overlap_chunk + [sentence]
+                current_len = len(" ".join(current_chunk))
+            else:
+                current_chunk = [sentence]
+                current_len = len(sentence)
         else:
             current_chunk.append(sentence)
-            current_len += len(sentence) + 1
+            current_len += len(sentence) + (1 if len(current_chunk) > 1 else 0)
 
     if current_chunk:
         chunks.append(" ".join(current_chunk))
@@ -312,7 +333,7 @@ async def pdf_embeddings(body: PDFBody, Authorization: Optional[str] = Header(No
                     logger.error(f"Error extracting text from page {page_number}: {e}")
                     continue
 
-                for i, chunk in enumerate(chunk_text(page_text, max_chars=body.chunk_size)):
+                for i, chunk in enumerate(chunk_text(page_text, max_chars=body.chunk_size, overlap_chars=body.chunk_overlap)):
                     extracted_chunks.append(chunk)
                     metadata.append({
                         "text": chunk,
